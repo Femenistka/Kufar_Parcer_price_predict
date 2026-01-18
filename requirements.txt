@@ -1,0 +1,15 @@
+# Библиотеки для парсера Kufar
+requests>=2.31.0          # HTTP запросы
+beautifulsoup4>=4.12.0    # Парсинг HTML
+lxml>=4.9.0               # Быстрый XML/HTML парсер для BeautifulSoup
+
+# Дополнительные библиотеки для проекта
+pandas>=2.0.0             # Работа с данными
+sqlalchemy>=2.0.0         # Работа с БД (SQLite)
+streamlit>=1.28.0         # Web UI
+joblib>=1.3.0             # Загрузка ML моделей
+scikit-learn>=1.3.0       # ML библиотека
+numpy>=1.24.0             # Численные операции
+
+# Утилиты
+python-dateutil>=2.8.0    # Парсинг дат
