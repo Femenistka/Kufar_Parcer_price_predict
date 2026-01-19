@@ -1,4 +1,4 @@
-# Библиотеки для парсера Kufar
+в# Библиотеки для парсера Kufar
 requests>=2.31.0          # HTTP запросы
 beautifulsoup4>=4.12.0    # Парсинг HTML
 lxml>=4.9.0               # Быстрый XML/HTML парсер для BeautifulSoup

@@ -153,7 +153,10 @@ class KufarScraper:
     def extract_next_cursor(self, soup: BeautifulSoup) -> Optional[str]:
         """Извлечение cursor для следующей страницы из HTML."""
         try:
-            # Ищем cursor в ссылках
+            # Ищем cursor только в явных ссылках на следующую страницу
+            # Проверяем все ссылки с cursor в href
+            found_cursors = []
+            
             for link in soup.find_all('a', href=True):
                 href = link.get('href', '')
                 if 'cursor=' in href:
@@ -164,13 +167,47 @@ class KufarScraper:
                             decoded = unquote(cursor)
                             decoded_bytes = b64decode(decoded + '==')
                             cursor_data = json.loads(decoded_bytes)
-                            if isinstance(cursor_data, dict) and cursor_data.get('p', 0) >= 2:
-                                return cursor
+                            # Проверяем, что это действительно следующая страница (p >= 2)
+                            if isinstance(cursor_data, dict):
+                                page_num = cursor_data.get('p', 0)
+                                if page_num >= 2:
+                                    found_cursors.append((cursor, page_num))
                         except:
+                            # Если не удалось декодировать, но cursor длинный, сохраняем его
                             if len(cursor) > 20:
-                                return cursor
+                                found_cursors.append((cursor, 999))  # Неизвестный номер страницы
             
-            # Если cursor не найден в ссылках, строим его из последнего item ID
+            # Если нашли cursors, возвращаем тот, который указывает на самую дальнюю страницу
+            if found_cursors:
+                # Сортируем по номеру страницы и берем максимальный
+                found_cursors.sort(key=lambda x: x[1], reverse=True)
+                return found_cursors[0][0]
+            
+            # Если не нашли cursor в ссылках, проверяем наличие кнопок пагинации
+            # Ищем элементы с текстом "следующая", "next" и т.д.
+            pagination_keywords = ['следующ', 'next', 'далее', 'вперед', 'forward', '>', '→']
+            has_next_button = False
+            
+            for element in soup.find_all(['a', 'button', 'span', 'div']):
+                text = element.get_text(strip=True).lower()
+                href = element.get('href', '')
+                
+                # Проверяем текст и наличие cursor в href
+                if any(keyword in text for keyword in pagination_keywords):
+                    if 'cursor=' in href:
+                        match = re.search(r'cursor=([^&"\'>\s]+)', href)
+                        if match:
+                            return match.group(1)
+                    # Если есть aria-label или data-атрибуты, указывающие на следующую страницу
+                    aria_label = element.get('aria-label', '').lower()
+                    if any(keyword in aria_label for keyword in pagination_keywords):
+                        if 'cursor=' in href:
+                            match = re.search(r'cursor=([^&"\'>\s]+)', href)
+                            if match:
+                                return match.group(1)
+            
+            # Если не нашли явной ссылки, строим cursor из последнего item ID
+            # Это нужно для перехода на следующую страницу, когда явных ссылок нет
             item_links = soup.find_all('a', href=re.compile(r'/item/\d+'))
             if item_links:
                 last_href = item_links[-1].get('href', '')
@@ -179,14 +216,16 @@ class KufarScraper:
                     cursor_data = {
                         "t": "abs",
                         "f": True,
-                        "p": 2,
+                        "p": 2,  # Следующая страница
                         "pit": item_match.group(1)
                     }
                     cursor_json = json.dumps(cursor_data, separators=(',', ':'))
                     cursor_b64 = b64encode(cursor_json.encode()).decode('utf-8')
                     return unquote(cursor_b64)
             
+            # Если не нашли объявлений и не нашли cursor, значит это последняя страница
             return None
+            
         except Exception:
             return None
     
