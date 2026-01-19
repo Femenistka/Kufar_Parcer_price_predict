@@ -1,0 +1,11 @@
+{
+    "name": "precision",
+    "description": "SubName grouped into OTHER, stable precision estimation",
+    "features": ["Brand", "SubName(only", "Age", "Keys", "HammerAction", "VelocitySensitive", "Timbres"],
+    "mae": 71.76,
+    "median_ae": 67.99,
+    "max_error": 225,
+    "cv": "LOOCV",
+    "created_at": "2026-01-19"
+  }
+  

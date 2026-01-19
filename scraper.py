@@ -3,18 +3,20 @@
 """
 
 import time
-import re
 import json
-import sqlite3
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 from datetime import datetime, timedelta
 from urllib.parse import urlencode, unquote
 from base64 import b64decode, b64encode
-
+import re
+import unicodedata
+import sqlite3
+from typing import Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
+from typing import Iterable
 
 
 @dataclass
@@ -112,6 +114,286 @@ class Database:
     def close(self):
         """Закрытие соединения с БД."""
         self.conn.close()
+
+    def _ensure_name_columns(self) -> None:
+        """Добавляет колонки Name/SubName в listings, если их нет."""
+        cursor = self.conn.cursor()
+
+        cursor.execute("PRAGMA table_info(listings)")
+        cols = {row[1] for row in cursor.fetchall()}
+
+        if "Name" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN Name TEXT")
+        if "SubName" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN SubName TEXT")
+
+        self.conn.commit()
+
+    @staticmethod
+    def _normalize_title_text(s: Optional[str]) -> str:
+        """Нормализация строки: Unicode, пробелы, верхний регистр."""
+        if not s:
+            return ""
+
+        # NFKC + убрать диакритику
+        s = unicodedata.normalize("NFKC", s)
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+        # привести разные дефисы к "-"
+        s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+
+        # upper + трим + схлопнуть пробелы
+        s = s.upper().strip()
+        s = re.sub(r"\s+", " ", s)
+
+        return s
+
+    @staticmethod
+    def _apply_synonyms(s: str) -> str:
+        """
+        Заменяет русские/транслит варианты на каноничные токены.
+        Делается ПОСЛЕ upper().
+        """
+        if not s:
+            return s
+
+        # 1) бренды
+        brand_patterns = [
+            (r"\b(КАСИО|КЭ?СИО|CASIO)\b", "CASIO"),
+            (r"\b(ЯМАХА|YAMAHA)\b", "YAMAHA"),
+        ]
+
+        # 2) серии / линейки (русские варианты тоже)
+        series_patterns = [
+            (r"\b(ПСР|PSR)\b", "PSR"),
+            # "P" важно заменить аккуратно (часто встречается как "P-45", "P 125")
+            (r"\bP(?=\s*[-]?\s*\d)", "P"),
+            (r"\b(DGX)\b", "DGX"),
+            (r"\b(CLP)\b", "CLP"),
+            (r"\b(YDP)\b", "YDP"),
+            (r"\b(NP)\b", "NP"),
+            (r"\b(MX)\b", "MX"),
+            (r"\b(DX)\b", "DX"),
+            (r"\b(CS)\b", "CS"),
+
+            (r"\b(CDP)\b", "CDP"),
+            (r"\b(PX)\b", "PX"),
+            (r"\b(AP)\b", "AP"),
+            (r"\b(CTK)\b", "CTK"),
+            (r"\b(CT\s*-\s*S)\b", "CT-S"),
+            (r"\b(CT\s*-\s*X)\b", "CT-X"),
+            (r"\b(WK)\b", "WK"),
+            (r"\b(SA)\b", "SA"),
+            (r"\b(LK)\b", "LK"),
+        ]
+
+        # 3) дополнительные чистки: "CELVIANO" / "CLAVINOVA" — не subname, но полезно оставить (не мешает)
+        misc_patterns = [
+            (r"\b(CELVIANO)\b", "CELVIANO"),
+            (r"\b(CLAVINOVA)\b", "CLAVINOVA"),
+            (r"\b(PIAGGERO)\b", "PIAGGERO"),
+        ]
+
+        for pat, repl in brand_patterns:
+            s = re.sub(pat, repl, s)
+
+        for pat, repl in series_patterns:
+            s = re.sub(pat, repl, s)
+
+        for pat, repl in misc_patterns:
+            s = re.sub(pat, repl, s)
+
+        # почистим пробелы вокруг дефисов (P - 45 -> P-45, CT - S -> CT-S)
+        s = re.sub(r"\s*-\s*", "-", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        # Нормализация типичных форматов:
+        # PSR E-463 -> PSR-E463, PSR E463 -> PSR-E463
+        s = re.sub(r"\bPSR\s+E\s*-\s*(\d+)\b", r"PSR-E\1", s)
+        s = re.sub(r"\bPSR\s+E(\d+)\b", r"PSR-E\1", s)
+
+        # CDP 120BK / CDP-120BK -> CDP-120BK (чтобы CDP точно было видно)
+        s = re.sub(r"\bCDP\s*-\s*(S?\d+)\b", r"CDP-\1", s)
+        s = re.sub(r"\bCDP\s+(\d+[A-Z]*)\b", r"CDP-\1", s)
+
+        # NP32 -> NP32 (ничего не меняем, но гарантируем верхний регистр уже есть)
+
+
+        return s
+
+    
+    @staticmethod
+    def _extract_name_subname(s: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Извлекает:
+        - Name: CASIO / YAMAHA (или выводит по серии, если бренд не указан)
+        - SubName: PSR / P / DGX / CLP / YDP / NP / CDP / CTK / CT-S / CT-X / PX / AP / WK / SA / LK / MX / DX / CS
+        Работает с вариантами типа CT-X800, NP32, CLP-535WH (где серия прилеплена к цифрам/буквам).
+        """
+        if not s:
+            return None, None
+
+        # 1) BRAND (явно)
+        name = None
+        if re.search(r"\bCASIO\b", s):
+            name = "CASIO"
+        elif re.search(r"\bYAMAHA\b", s):
+            name = "YAMAHA"
+
+        # 2) SUBNAME: ищем токены как "слово" ИЛИ как префикс перед цифрами/буквами
+        def has_token(token: str) -> bool:
+            # token как отдельное слово, или token перед цифрой/буквой (CT-X800 / NP32 / CLP-535WH)
+            return re.search(rf"(?:\b{re.escape(token)}\b)|(?:\b{re.escape(token)}(?=[0-9A-Z]))", s) is not None
+
+        # порядок важен: более специфичное раньше
+        subname_order = [
+            "PSR", "DGX", "CLP", "YDP", "NP", "MX", "DX", "CS",
+            "CDP", "PX", "AP", "CT-S", "CT-X", "CTK", "WK", "SA", "LK",
+            "P",  # P ставим ближе к концу, чтобы не перехватывал лишнее
+        ]
+
+        subname = None
+        for token in subname_order:
+            if has_token(token):
+                subname = token
+                break
+
+        # 3) Спец-кейсы для Yamaha P-серии (P-45 / P 125 / P125)
+        if subname is None and re.search(r"\bP\s*-\s*\d+|\bP\s+\d+|\bP\d+\b", s):
+            subname = "P"
+
+        # 4) Если бренд НЕ указан — выводим бренд по серии (очень полезно для строк типа "Синтезатор PSR E-463")
+        if name is None and subname is not None:
+            yamaha_series = {"PSR", "P", "DGX", "CLP", "YDP", "NP", "MX", "DX", "CS"}
+            casio_series = {"CDP", "PX", "AP", "CT-S", "CT-X", "CTK", "WK", "SA", "LK"}
+
+            if subname in yamaha_series:
+                name = "YAMAHA"
+            elif subname in casio_series:
+                name = "CASIO"
+
+        return name, subname
+
+
+    def normalize_titles_to_name_subname(self, batch_size: int = 500) -> int:
+        """
+        Обходит listings, парсит title -> (Name, SubName) и записывает в БД.
+        Возвращает количество обновлённых строк.
+        """
+        self._ensure_name_columns()
+
+        cursor = self.conn.cursor()
+
+        cursor.execute("SELECT id, title FROM listings WHERE title IS NOT NULL")
+        rows = cursor.fetchall()
+
+        updated = 0
+        to_update = []
+
+        for row_id, title in rows:
+            t = self._normalize_title_text(title)
+            t = self._apply_synonyms(t)
+            name, subname = self._extract_name_subname(t)
+
+            # записываем только если есть хоть что-то
+            if name is None and subname is None:
+                continue
+
+            to_update.append((name, subname, row_id))
+
+            if len(to_update) >= batch_size:
+                cursor.executemany(
+                    "UPDATE listings SET Name = ?, SubName = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    to_update
+                )
+                self.conn.commit()
+                updated += len(to_update)
+                to_update = []
+
+        if to_update:
+            cursor.executemany(
+                "UPDATE listings SET Name = ?, SubName = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                to_update
+            )
+            self.conn.commit()
+            updated += len(to_update)
+
+        return updated
+
+    def save_listing_return_id(self, listing: ListingRaw) -> int | None:
+        """Сохранить/обновить и вернуть id строки."""
+        try:
+            cursor = self.conn.cursor()
+            published_at_str = listing.published_at.isoformat() if listing.published_at else None
+
+            cursor.execute("""
+                INSERT INTO listings (source_id, url, title, price, currency, published_at, location, description, raw_text, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(source_id) DO UPDATE SET
+                    url=excluded.url,
+                    title=excluded.title,
+                    price=excluded.price,
+                    currency=excluded.currency,
+                    published_at=excluded.published_at,
+                    location=excluded.location,
+                    description=excluded.description,
+                    raw_text=excluded.raw_text,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (
+                listing.source_id, listing.url, listing.title, listing.price, listing.currency,
+                published_at_str, listing.location, listing.description, listing.raw_text
+            ))
+
+            self.conn.commit()
+
+            cursor.execute("SELECT id FROM listings WHERE source_id = ?", (listing.source_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+
+        except Exception as e:
+            print(f"Ошибка при сохранении объявления: {e}")
+            self.conn.rollback()
+            return None
+
+    def save_listings_return_ids(self, listings: list[ListingRaw]) -> list[int]:
+        ids: list[int] = []
+        for l in listings:
+            row_id = self.save_listing_return_id(l)
+            if row_id is not None:
+                ids.append(row_id)
+        return ids
+    
+    def normalize_titles_for_ids(self, ids: Iterable[int]) -> int:
+        """Нормализовать Name/SubName для конкретных listings.id"""
+        self._ensure_name_columns()
+        cursor = self.conn.cursor()
+
+        # забираем title только для указанных id
+        ids = list(ids)
+        if not ids:
+            return 0
+
+        placeholders = ",".join(["?"] * len(ids))
+        cursor.execute(f"SELECT id, title FROM listings WHERE id IN ({placeholders})", ids)
+        rows = cursor.fetchall()
+
+        to_update = []
+        for row_id, title in rows:
+            t = self._normalize_title_text(title)
+            t = self._apply_synonyms(t)
+            name, subname = self._extract_name_subname(t)
+            if name is None and subname is None:
+                continue
+            to_update.append((name, subname, row_id))
+
+        if to_update:
+            cursor.executemany(
+                "UPDATE listings SET Name=?, SubName=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                to_update
+            )
+            self.conn.commit()
+
+        return len(to_update)
+
 
 
 class KufarScraper:

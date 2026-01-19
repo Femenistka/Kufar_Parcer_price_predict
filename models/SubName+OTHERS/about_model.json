@@ -1,0 +1,11 @@
+{
+    "name": "market",
+    "description": "SubName grouped into OTHER, stable market estimation",
+    "features": ["Brand", "SubName(OTHER)", "Age", "Keys", "HammerAction", "VelocitySensitive", "Timbres"],
+    "mae": 71.21,
+    "median_ae": 63.87,
+    "max_error": 256.27,
+    "cv": "LOOCV",
+    "created_at": "2026-01-19"
+  }
+  

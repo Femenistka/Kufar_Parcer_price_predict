@@ -242,8 +242,18 @@ with tab1:
                     # Сохранение в БД
                     saved_count = db.save_listings(listings)
                     
+                    saved_ids = db.save_listings_return_ids(listings)
+                    saved_count = len(saved_ids)
+
+                    normalized_count = db.normalize_titles_for_ids(saved_ids)
+
                     st.success(f"✅ Парсинг завершен!")
-                    st.info(f"📊 Найдено объявлений: {len(listings)}\n💾 Сохранено в БД: {saved_count}")
+                    st.info(
+                        f"📊 Найдено: {len(listings)}\n"
+                        f"💾 Сохранено: {saved_count}\n"
+                        f"🧼 Нормализовано: {normalized_count}"
+                    )
+
                     
                     # Сохраняем информацию о последнем парсинге в session state
                     st.session_state['last_scrape_count'] = len(listings)
