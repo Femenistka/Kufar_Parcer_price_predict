@@ -16,8 +16,9 @@ from typing import Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
-from typing import Iterable
-
+import pandas as pd
+import joblib
+import numpy as np
 
 @dataclass
 class ListingRaw:
@@ -115,10 +116,9 @@ class Database:
         """Закрытие соединения с БД."""
         self.conn.close()
 
-    def _ensure_name_columns(self) -> None:
-        """Добавляет колонки Name/SubName в listings, если их нет."""
+    def _ensure_model_columns(self) -> None:
+        """Добавляет колонки Name/SubName/IndexModel в listings, если их нет."""
         cursor = self.conn.cursor()
-
         cursor.execute("PRAGMA table_info(listings)")
         cols = {row[1] for row in cursor.fetchall()}
 
@@ -126,6 +126,10 @@ class Database:
             cursor.execute("ALTER TABLE listings ADD COLUMN Name TEXT")
         if "SubName" not in cols:
             cursor.execute("ALTER TABLE listings ADD COLUMN SubName TEXT")
+        if "IndexModel" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN IndexModel TEXT")
+        if "IndexModelInt" not in cols:
+            cursor.execute("ALTER TABLE listings ADD COLUMN IndexModelInt INTEGER")
 
         self.conn.commit()
 
@@ -220,7 +224,6 @@ class Database:
 
         return s
 
-    
     @staticmethod
     def _extract_name_subname(s: str) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -272,7 +275,6 @@ class Database:
                 name = "CASIO"
 
         return name, subname
-
 
     def normalize_titles_to_name_subname(self, batch_size: int = 500) -> int:
         """
@@ -362,12 +364,10 @@ class Database:
                 ids.append(row_id)
         return ids
     
-    def normalize_titles_for_ids(self, ids: Iterable[int]) -> int:
-        """Нормализовать Name/SubName для конкретных listings.id"""
-        self._ensure_name_columns()
+    def normalize_titles_for_ids(self, ids):
+        self._ensure_model_columns()
         cursor = self.conn.cursor()
 
-        # забираем title только для указанных id
         ids = list(ids)
         if not ids:
             return 0
@@ -380,21 +380,356 @@ class Database:
         for row_id, title in rows:
             t = self._normalize_title_text(title)
             t = self._apply_synonyms(t)
+
             name, subname = self._extract_name_subname(t)
-            if name is None and subname is None:
+            index_model = self._extract_index_model(t, name, subname)
+
+            # если вообще ничего не нашли — пропускаем
+            if name is None and subname is None and index_model is None:
                 continue
-            to_update.append((name, subname, row_id))
+
+            to_update.append((name, subname, index_model, row_id))
 
         if to_update:
             cursor.executemany(
-                "UPDATE listings SET Name=?, SubName=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                """
+                UPDATE listings
+                SET
+                Name = COALESCE(?, Name),
+                SubName = COALESCE(?, SubName),
+                IndexModel = COALESCE(?, IndexModel),
+                updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
                 to_update
             )
             self.conn.commit()
 
         return len(to_update)
 
+    def ensure_enriched_prediction_column(self, table: str = "listings_enriched") -> None:
+            """Добавляет price_predict в таблицу listings_enriched, если его нет."""
+            cur = self.conn.cursor()
+            cur.execute(f"PRAGMA table_info({table})")
+            cols = {row[1] for row in cur.fetchall()}
 
+            if "price_predict" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN price_predict REAL")
+            if "market_price" not in cols:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN market_price REAL")
+
+            self.conn.commit()
+
+    @staticmethod
+    def _extract_index_model(normalized_title: str, name: Optional[str], subname: Optional[str]) -> Optional[str]:
+        """
+        Грубый MVP-метод:
+        - убираем из строки Name/SubName
+        - ищем группы цифр (2+ цифры)
+        - берём "самую вероятную": сначала 3-4 цифры, потом 2 цифры
+        """
+        if not normalized_title:
+            return None
+
+        s = normalized_title
+
+        # 1) выкинуть бренд/серию, если известны
+        if name:
+            s = re.sub(rf"\b{re.escape(name)}\b", " ", s)
+        if subname:
+            # subname может быть CT-S, CT-X => обязательно escape
+            s = re.sub(rf"\b{re.escape(subname)}\b", " ", s)
+
+        # 2) почистить популярный шум (опционально, но помогает)
+        # (можно расширять)
+        s = re.sub(r"\b(PIANO|PIANINO|SYNTH|SYNTHESIZER|СИНТЕЗАТОР|ПИАНИНО|ЦИФРОВОЕ|ЭЛЕКТРОННОЕ)\b", " ", s)
+        s = re.sub(r"\b(BK|WH|SR|WE|B|BLACK|WHITE)\b", " ", s)
+
+        # 3) привести разделители к пробелам, чтобы легче ловить цифры
+        s = s.replace("-", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+
+        if not s:
+            return None
+
+        # 4) сначала ищем "классические индексы" 3-4 цифры: 100, 270, 463, 164, 535, 620, 775...
+        m = re.search(r"\b(\d{3,4})\b", s)
+        if m:
+            return m.group(1)
+
+        # 5) если не нашли — берём 2 цифры (NP32, MX61, SA76, F51...)
+        m = re.search(r"\b(\d{2})\b", s)
+        if m:
+            return m.group(1)
+
+        # 6) крайний случай: вообще любые цифры
+        m = re.search(r"(\d+)", s)
+        return m.group(1) if m else None
+
+    def load_model_specs_csv(
+        self,
+        csv_path: str,
+        table_name: str = "model_specs",
+        if_exists: str = "replace"
+    ) -> int:
+        """
+        Загружает CSV с характеристиками в SQLite таблицу model_specs.
+        Требует колонки: Name, SubName, IndexModel + любые характеристики.
+        Возвращает число строк.
+        """
+        df = pd.read_csv(csv_path)
+
+        # убрать мусорные индексы
+        for col in ["Unnamed: 0", "unnamed: 0"]:
+            if col in df.columns:
+                df = df.drop(columns=[col])
+
+        required = {"Name", "SubName", "IndexModel"}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"CSV не содержит обязательные колонки: {sorted(missing)}")
+
+        # нормализуем ключи
+        df["Name"] = df["Name"].astype(str).str.upper().str.strip()
+        df["SubName"] = df["SubName"].astype(str).str.upper().str.strip()
+
+        # IndexModel -> int (если не получается, будет <NA>)
+        df["IndexModelInt"] = pd.to_numeric(df["IndexModel"], errors="coerce").astype("Int64")
+
+        # bool -> 0/1 (удобно для ML и SQLite)
+        for bcol in ["HammerAction", "VelocitySensitive"]:
+            if bcol in df.columns:
+                # если уже bool или строки True/False
+                df[bcol] = df[bcol].map({True: 1, False: 0, "True": 1, "False": 0}).fillna(df[bcol])
+                df[bcol] = pd.to_numeric(df[bcol], errors="coerce").astype("Int64")
+
+        df.to_sql(table_name, self.conn, if_exists=if_exists, index=False)
+
+        cur = self.conn.cursor()
+        # индексы для быстрого мэтчинга
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name_sub ON {table_name}(Name, SubName)")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_name_sub_idx ON {table_name}(Name, SubName, IndexModelInt)")
+        self.conn.commit()
+
+        return len(df)
+    
+    def build_enriched_listings_table(
+        self,
+        specs_table: str = "model_specs",
+        out_table: str = "listings_enriched",
+        only_with_keys: bool = True
+    ) -> int:
+        """
+        Создаёт таблицу out_table как результат JOIN:
+        listings (Name/SubName/IndexModelInt)
+            + model_specs (Name/SubName/IndexModelInt)
+        Правило мэтчинга:
+        - Name/SubName: совпадение без регистра (мы храним uppercase)
+        - IndexModelInt: точное, иначе ближайшее по |diff|
+        Возвращает число строк в out_table.
+        """
+        self._ensure_model_columns()
+        cur = self.conn.cursor()
+
+        # Если IndexModelInt ещё не заполнен для listings — попробуем заполнить из IndexModel (если оно числовое)
+        cur.execute("""
+            UPDATE listings
+            SET IndexModelInt = CASE
+                WHEN IndexModelInt IS NULL THEN CAST(IndexModel AS INTEGER)
+                ELSE IndexModelInt
+            END
+            WHERE IndexModel IS NOT NULL
+        """)
+        self.conn.commit()
+
+        # Получаем колонки из таблицы характеристик, чтобы динамически их притащить
+        cur.execute(f"PRAGMA table_info({specs_table})")
+        spec_cols = [row[1] for row in cur.fetchall()]
+        # ключевые колонки спецификаций
+        key_cols = {"Name", "SubName", "IndexModel", "IndexModelInt"}
+        feature_cols = [c for c in spec_cols if c not in key_cols]
+
+        # пересоздаём итоговую таблицу
+        cur.execute(f"DROP TABLE IF EXISTS {out_table}")
+
+        # собираем SELECT-часть
+        select_features = ", ".join([f"best.{c} AS {c}" for c in feature_cols]) if feature_cols else ""
+        if select_features:
+            select_features = ", " + select_features
+
+        # optionally фильтр: только те listings, где уже есть ключи
+        where_clause = ""
+        if only_with_keys:
+            where_clause = "WHERE l.Name IS NOT NULL AND l.SubName IS NOT NULL AND l.IndexModelInt IS NOT NULL"
+
+        # ВАЖНО: window function row_number() выберет самый близкий IndexModelInt
+        sql = f"""
+        CREATE TABLE {out_table} AS
+        WITH candidates AS (
+            SELECT
+                l.id AS listing_id,
+                s.*,
+                ABS(s.IndexModelInt - l.IndexModelInt) AS dist,
+                ROW_NUMBER() OVER (
+                    PARTITION BY l.id
+                    ORDER BY ABS(s.IndexModelInt - l.IndexModelInt) ASC
+                ) AS rn
+            FROM listings l
+            JOIN {specs_table} s
+            ON l.Name = s.Name
+            AND l.SubName = s.SubName
+            WHERE l.IndexModelInt IS NOT NULL
+            AND s.IndexModelInt IS NOT NULL
+        ),
+        best AS (
+            SELECT * FROM candidates WHERE rn = 1
+        )
+        SELECT
+            l.id AS listing_id,
+            l.source_id,
+            l.description,
+            l.raw_text,
+            l.url,
+            l.title,
+            l.price,
+            l.currency,
+            l.published_at,
+            l.location,
+            l.created_at,
+            l.updated_at,
+            l.Name,
+            l.SubName,
+            l.IndexModel,
+            l.IndexModelInt,
+            best.IndexModelInt AS MatchedIndexModelInt,
+            best.dist AS IndexModelDistance
+            {select_features}
+        FROM listings l
+        LEFT JOIN best ON best.listing_id = l.id
+        {where_clause}
+        ;
+        """
+
+        cur.execute(sql)
+
+        # индексы на итоговую таблицу
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{out_table}_listing_id ON {out_table}(listing_id)")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{out_table}_name_sub_idx ON {out_table}(Name, SubName, IndexModelInt)")
+        self.conn.commit()
+
+        cur.execute(f"SELECT COUNT(*) FROM {out_table}")
+        return int(cur.fetchone()[0])
+
+    def update_price_predictions(
+        self,
+        df_pred: pd.DataFrame,
+        table: str = "listings_enriched",
+        id_col: str = "listing_id",
+        market_col: str = "market_price",
+    ) -> int:
+        """
+        Обновляет в listings_enriched значения market_price и price_predict
+        по ключу listing_id.
+        price_predict = round(market_price, -1) (до десятков)
+        """
+        self.ensure_enriched_prediction_column(table)
+
+        if id_col not in df_pred.columns or market_col not in df_pred.columns:
+            raise ValueError(f"Нужны колонки {id_col} и {market_col} в df_pred")
+
+        tmp = df_pred[[id_col, market_col]].copy()
+        tmp[market_col] = pd.to_numeric(tmp[market_col], errors="coerce")
+        tmp.dropna(inplace=True)
+
+        # округление до десятков
+        tmp["price_predict"] = tmp[market_col].round(-1)
+
+        rows = list(tmp[[id_col, market_col, "price_predict"]].itertuples(index=False, name=None))
+        if not rows:
+            return 0
+
+        cur = self.conn.cursor()
+        cur.executemany(
+            f"""
+            UPDATE {table}
+            SET
+              market_price = ?,
+              price_predict = ?,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE {id_col} = ?
+            """,
+            [(market, pred, lid) for (lid, market, pred) in rows]
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def fetch_enriched_for_scoring(self) -> pd.DataFrame:
+        query = """
+            SELECT
+                listing_id,
+                price,
+                Name,
+                SubName,
+                YearIntroduced,
+                Keys,
+                HammerAction,
+                VelocitySensitive,
+                Timbres
+            FROM listings_enriched
+            WHERE
+                price IS NOT NULL
+                AND Name IS NOT NULL
+                AND SubName IS NOT NULL
+                AND YearIntroduced IS NOT NULL
+                AND Keys IS NOT NULL
+                AND HammerAction IS NOT NULL
+                AND VelocitySensitive IS NOT NULL
+                AND Timbres IS NOT NULL
+        """
+        return pd.read_sql_query(query, self.conn)
+
+    def run_scoring_and_save_predictions(
+        self,
+        model_path: str,
+        current_year: int = 2026,
+        subname_min_count: int = 3,
+    ) -> dict:
+        """
+        1) читает listings_enriched
+        2) готовит фичи
+        3) делает предикт
+        4) пишет market_price и price_predict обратно в listings_enriched
+        """
+        df = self.fetch_enriched_for_scoring()
+        if df.empty:
+            return {"scored": 0, "updated": 0}
+
+        # ---- подготовка фич (логика как в твоём model.py) ----
+        df = df.dropna().copy()
+
+        vc = df["SubName"].value_counts()
+        rare = vc[vc < subname_min_count].index
+        df["SubName"] = df["SubName"].replace(rare, "OTHER")
+
+        df["Age"] = current_year - df["YearIntroduced"]
+        df.drop(columns=["YearIntroduced"], inplace=True)
+
+        # ---- модель ----
+        model = joblib.load(model_path)
+
+        # маппинг unknown SubName -> OTHER по энкодеру
+        preprocess = model.named_steps["preprocess"]
+        ohe = preprocess.named_transformers_["cat"]
+        known = set(ohe.categories_[1])
+        df["SubName"] = df["SubName"].astype(str).str.upper().str.strip()
+        df.loc[~df["SubName"].isin(known), "SubName"] = "OTHER"
+
+        FEATURES = ["Name", "SubName", "Age", "Keys", "HammerAction", "VelocitySensitive", "Timbres"]
+        # Перманентное округление предсказаний до десятков 
+        df["market_price"] = np.round(model.predict(df[FEATURES]), -1)
+
+        updated = self.update_price_predictions(df_pred=df, id_col="listing_id", market_col="market_price")
+        return {"scored": int(len(df)), "updated": int(updated)}
 
 class KufarScraper:
     """Парсер объявлений с Kufar."""
@@ -653,6 +988,8 @@ def main():
     print("=" * 60)
     print("Парсер Kufar - Клавишные инструменты")
     print("=" * 60)
+
+
     
     scraper = KufarScraper(delay=1.0, timeout=10)
     db = Database("keyscout.db")

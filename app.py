@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import List
 from scraper import KufarScraper, Database, ListingRaw
 import time
+import pandas as pd
+import numpy as np
 from DB_functions import clear_db
 
 
@@ -17,6 +19,43 @@ st.set_page_config(
     page_icon="🎹",
     layout="wide"
 )
+
+def build_market_analytics_df(listings: list[dict]) -> pd.DataFrame:
+    """Преобразует listings (list[dict]) в DataFrame и чистит базовые поля."""
+    df = pd.DataFrame(listings)
+
+    # безопасные поля
+    for col in ["price", "market_price"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # оставляем только строки, где есть обе цены
+    df = df.dropna(subset=["price", "market_price"]).copy()
+
+    # вычисления
+    df["delta"] = df["price"] - df["market_price"]               # >0 дороже рынка, <0 дешевле рынка
+    df["gain"] = df["market_price"] - df["price"]                # выгода (если >0)
+    df["gain_pct"] = (df["gain"] / df["market_price"]) * 100     # выгода в %
+
+    return df
+
+def market_metrics(df: pd.DataFrame) -> dict:
+    """Считает основные метрики рынка."""
+    if df.empty:
+        return {}
+
+    metrics = {
+        "Оценено объявлений (есть price + market_price)": int(len(df)),
+        "Средняя разница price - market (Bias), BYN": float(df["delta"].mean()),
+        "Медианная разница price - market, BYN": float(df["delta"].median()),
+        "Среднее |price - market| (MAE), BYN": float(df["delta"].abs().mean()),
+        "Медиана |price - market|, BYN": float(df["delta"].abs().median()),
+        "Доля объявлений ниже рынка (price < market), %": float((df["price"] < df["market_price"]).mean() * 100),
+        "Доля объявлений выше рынка (price > market), %": float((df["price"] > df["market_price"]).mean() * 100),
+        "Макс переплата (price - market), BYN": float(df["delta"].max()),
+        "Макс выгода (market - price), BYN": float(df["gain"].max()),
+    }
+    return metrics
 
 
 def scrape_all_pages(scraper: KufarScraper, region: str = "minsk", 
@@ -118,22 +157,43 @@ def format_date(date: datetime) -> str:
 
 def display_listing_card(listing_data: dict):
     """Отображение карточки объявления."""
-    col1, col2 = st.columns([3, 1])
-    
+    col1, col2, col3 = st.columns([3, 2, 2])
+
+    title = listing_data.get("title") or "Без названия"
+    description = listing_data.get("description") or ""
+    market_price = listing_data.get("market_price")
+    price = listing_data.get("price")
+    currency = listing_data.get("currency") or "BYN"
+    location = listing_data.get("location") or "Не указано"
+    published_at = listing_data.get("published_at")
+    url = listing_data.get("url")
+
     with col1:
-        st.markdown(f"### {listing_data['title'] or 'Без названия'}")
-        if listing_data['description']:
-            st.markdown(f"*{listing_data['description'][:200]}...*" if len(listing_data['description']) > 200 else f"*{listing_data['description']}*")
-    
+        st.markdown(f"### {title}")
+        if description:
+            short = (description[:200] + "...") if len(description) > 200 else description
+            st.markdown(f"*{short}*")
+
     with col2:
-        st.markdown(f"**{format_price(listing_data['price'], listing_data['currency'])}**")
-        st.markdown(f"📍 {listing_data['location'] or 'Не указано'}")
-        st.markdown(f"📅 {format_date(listing_data['published_at'])}")
-    
-    if listing_data['url']:
-        st.markdown(f"[🔗 Открыть объявление]({listing_data['url']})")
-    
+        if market_price is None:
+            st.markdown("### 💩 не хватило данных")
+        else:
+            st.markdown(f"### {format_price(market_price, currency)}")
+
+    with col3:
+        if price is not None:
+            st.markdown(f"**{format_price(price, currency)}**")
+        else:
+            st.markdown("**Цена не указана**")
+
+        st.markdown(f"📍 {location}")
+        st.markdown(f"📅 {format_date(published_at)}")
+
+    if url:
+        st.markdown(f"[🔗 Открыть объявление]({url})")
+
     st.divider()
+
 
 
 def get_listings_from_db(db_path: str = "keyscout.db") -> List[dict]:
@@ -144,8 +204,8 @@ def get_listings_from_db(db_path: str = "keyscout.db") -> List[dict]:
     
     cursor.execute("""
         SELECT source_id, url, title, price, currency, published_at, 
-               location, description, raw_text, created_at, updated_at
-        FROM listings
+               location, description, raw_text, created_at, updated_at, market_price
+        FROM listings_enriched
         ORDER BY updated_at DESC
     """)
     
@@ -172,14 +232,15 @@ def get_listings_from_db(db_path: str = "keyscout.db") -> List[dict]:
             'description': row['description'] or row['raw_text'] or '',
             'raw_text': row['raw_text'],
             'created_at': row['created_at'],
-            'updated_at': row['updated_at']
+            'updated_at': row['updated_at'],
+            'market_price': row['market_price'],
         })
     
     return listings
 
 
 # Главное меню - вкладки в шапке
-tab1, tab2 = st.tabs(["⚙️ Настройки парсинга", "📊 Результаты"])
+tab1, tab2, tab3 = st.tabs(["Настройки парсинга", "Результаты", "Аналитика"])
 
 with tab1:
     st.title("🎹 KeyScout - Парсер объявлений Kufar")
@@ -191,7 +252,7 @@ with tab1:
     col1, col2 = st.columns(2)
     
     with col1:
-        scrape_all = st.checkbox("Собрать все объявления", value=False)
+        scrape_all = st.checkbox("Собрать все объявления", value=True)
         # st.button("🧹 Очистить БД", type="primary", use_container_width=False, on_click=clear_db)
     
     with col2:
@@ -239,26 +300,45 @@ with tab1:
                             **test_params
                         )
                     
+
+                    db = Database("keyscout.db")
+                    n = db.load_model_specs_csv("/Users/artemsaman/Desktop/KeyScout/Характеристики_по_моделям.csv")  # путь свой
+                    print("Характеристики_по_моделям загружены:", n)
+                    # db.close()
+
                     # Сохранение в БД
                     saved_count = db.save_listings(listings)
-                    
+                    # 1) парсинг -> listings
                     saved_ids = db.save_listings_return_ids(listings)
                     saved_count = len(saved_ids)
 
+                    # 2) нормализация title -> Name/SubName/IndexModel
                     normalized_count = db.normalize_titles_for_ids(saved_ids)
+                    
+                    # 3) join -> listings_enriched
+                    enriched_count = db.build_enriched_listings_table()
+                    
+                    # 4) predict + write back
+                    stats = db.run_scoring_and_save_predictions(
+                        model_path="models/SubName+OTHERS/price_model_market.joblib",
+                        current_year=2026,
+                        subname_min_count=3
+                    )
+
 
                     st.success(f"✅ Парсинг завершен!")
                     st.info(
                         f"📊 Найдено: {len(listings)}\n"
-                        f"💾 Сохранено: {saved_count}\n"
-                        f"🧼 Нормализовано: {normalized_count}"
+                        f"💾 Сохранено: {len(saved_ids)}\n"
+                        f"🧼 Нормализовано: {normalized_count}\n"
+                        f"🔗 Обогащено характеристиками: {enriched_count}"
                     )
 
                     
                     # Сохраняем информацию о последнем парсинге в session state
                     st.session_state['last_scrape_count'] = len(listings)
                     st.session_state['last_scrape_saved'] = saved_count
-                    
+                    st.session_state['last_normalized_count'] = normalized_count
                 except Exception as e:
                     st.error(f"❌ Ошибка при парсинге: {str(e)}")
                 finally:
@@ -270,6 +350,7 @@ with tab1:
         st.subheader("Последний парсинг")
         st.metric("Найдено объявлений", st.session_state['last_scrape_count'])
         st.metric("Сохранено в БД", st.session_state['last_scrape_saved'])
+        st.metric("Нормализовано", st.session_state['last_normalized_count'])
 
 with tab2:
     st.title("📊 Результаты парсинга")
@@ -328,4 +409,54 @@ with tab2:
     except Exception as e:
         st.error(f"❌ Ошибка при загрузке данных: {str(e)}")
         st.exception(e)
+
+
+with tab3:
+    st.subheader("📊 Аналитика рынка")
+
+    # listings — это то, что ты уже получаешь через get_listings_from_db()
+    df_m = build_market_analytics_df(listings)
+
+    if df_m.empty:
+        st.warning("Нет данных для аналитики: нужны объявления, где заполнены price и market_price.")
+    else:
+        # 1) Основные метрики
+        m = market_metrics(df_m)
+
+        # красивый вывод метрик в 3 колонки
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Оценено объявлений", m["Оценено объявлений (есть price + market_price)"])
+        c2.metric("Доля ниже рынка", f"{m['Доля объявлений ниже рынка (price < market), %']:.1f}%")
+        c3.metric("Средняя |Δ| (MAE)", f"{m['Среднее |price - market| (MAE), BYN']:.0f} BYN")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Bias (price - market)", f"{m['Средняя разница price - market (Bias), BYN']:.0f} BYN")
+        c2.metric("Макс выгода", f"{m['Макс выгода (market - price), BYN']:.0f} BYN")
+        c3.metric("Макс переплата", f"{m['Макс переплата (price - market), BYN']:.0f} BYN")
+
+        with st.expander("Показать все метрики"):
+            st.json({k: (round(v, 2) if isinstance(v, float) else v) for k, v in m.items()})
+
+        st.divider()
+
+        # 2) Фильтр "выгодных" (price < market_price)
+        st.subheader("🔥 Выгодные объявления (price < market_price)")
+
+        # дополнительные пороги (опционально, удобно)
+        min_gain = st.slider("Минимальная выгода (BYN)", 0, 500, 50, 10)
+        min_gain_pct = st.slider("Минимальная выгода (%)", 0, 50, 10, 1)
+
+        df_bargains = df_m[(df_m["gain"] >= min_gain) & (df_m["gain_pct"] >= min_gain_pct)].copy()
+
+        st.caption(f"Найдено выгодных по фильтрам: {len(df_bargains)}")
+
+        # сортировка: самые выгодные сверху
+        df_bargains = df_bargains.sort_values(["gain", "gain_pct"], ascending=[False, False])
+
+        # делаем обратно список dict для display_listing_card
+        bargain_listings = df_bargains.to_dict(orient="records")
+
+        # 3) Отображение карточек только выгодных
+        for listing in bargain_listings:
+            display_listing_card(listing)
 
