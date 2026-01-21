@@ -33,7 +33,6 @@ class ListingRaw:
     description: str = ""
     raw_text: str = ""
 
-
 class Database:
     """Класс для работы с SQLite БД."""
     
@@ -558,9 +557,22 @@ class Database:
             select_features = ", " + select_features
 
         # optionally фильтр: только те listings, где уже есть ключи
-        where_clause = ""
+        conditions = []
         if only_with_keys:
-            where_clause = "WHERE l.Name IS NOT NULL AND l.SubName IS NOT NULL AND l.IndexModelInt IS NOT NULL"
+            conditions.append(
+                "l.Name IS NOT NULL "
+                "AND l.SubName IS NOT NULL "
+                "AND l.IndexModelInt IS NOT NULL"
+            )
+        # фильтр прокат / аренда
+        conditions.append(
+            "NOT ("
+            "LOWER(COALESCE(l.raw_text, '')) LIKE '%прокат%' "
+            "OR LOWER(COALESCE(l.raw_text, '')) LIKE '%аренда%'"
+            ")"
+        )
+        where_clause = "WHERE " + " AND ".join(conditions)
+        
 
         # ВАЖНО: window function row_number() выберет самый близкий IndexModelInt
         sql = f"""

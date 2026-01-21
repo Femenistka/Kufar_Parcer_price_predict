@@ -20,24 +20,78 @@ st.set_page_config(
     layout="wide"
 )
 
+def filter_possible_bargains(listings: list[dict], pct: float = 0.10) -> list[dict]:
+    """
+    Отбор "возможно выгодных" объявлений:
+    price попадает в диапазон ±pct от market_price.
+    Возвращает список dict, отсортированный по delta (price - market_price) по возрастанию
+    (сначала те, что чуть дешевле рынка).
+    """
+    out = []
+
+    for it in listings:
+        price = it.get("price")
+        mp = it.get("market_price")
+
+        # нужны обе цены
+        if price is None or mp is None:
+            continue
+
+        try:
+            price = float(price)
+            mp = float(mp)
+        except (TypeError, ValueError):
+            continue
+
+        if mp <= 0:
+            continue
+
+        low = mp * (1 - pct)
+        high = mp * (1 + pct)
+
+        if low <= price <= high:
+            it2 = dict(it)
+            it2["delta"] = price - mp            # <0 выгоднее
+            it2["delta_pct"] = (it2["delta"] / mp) * 100
+            out.append(it2)
+
+    out.sort(key=lambda x: x.get("delta", 0))
+    return out
+
+
 def build_market_analytics_df(listings: list[dict]) -> pd.DataFrame:
-    """Преобразует listings (list[dict]) в DataFrame и чистит базовые поля."""
+    """
+    Безопасно строит DataFrame для аналитики.
+    Никогда не падает, даже если БД пустая или таблицы только что очищены.
+    """
+    if not listings:
+        return pd.DataFrame()
+
     df = pd.DataFrame(listings)
 
-    # безопасные поля
-    for col in ["price", "market_price"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    required_cols = {"price", "market_price"}
+
+    # если нужных колонок нет — возвращаем пустой df
+    if not required_cols.issubset(df.columns):
+        return pd.DataFrame()
+
+    # приводим к числам
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["market_price"] = pd.to_numeric(df["market_price"], errors="coerce")
 
     # оставляем только строки, где есть обе цены
     df = df.dropna(subset=["price", "market_price"]).copy()
 
-    # вычисления
-    df["delta"] = df["price"] - df["market_price"]               # >0 дороже рынка, <0 дешевле рынка
-    df["gain"] = df["market_price"] - df["price"]                # выгода (если >0)
-    df["gain_pct"] = (df["gain"] / df["market_price"]) * 100     # выгода в %
+    if df.empty:
+        return df
+
+    # вычисляем метрики
+    df["delta"] = df["price"] - df["market_price"]
+    df["gain"] = df["market_price"] - df["price"]
+    df["gain_pct"] = (df["gain"] / df["market_price"]) * 100
 
     return df
+
 
 def market_metrics(df: pd.DataFrame) -> dict:
     """Считает основные метрики рынка."""
@@ -155,45 +209,55 @@ def format_date(date: datetime) -> str:
     return date.strftime("%d.%m.%Y %H:%M")
 
 
-def display_listing_card(listing_data: dict):
-    """Отображение карточки объявления."""
-    col1, col2, col3 = st.columns([3, 2, 2])
-
+def display_listing_card(listing_data: dict, add_benefits: bool = False):
     title = listing_data.get("title") or "Без названия"
     description = listing_data.get("description") or ""
-    market_price = listing_data.get("market_price")
+    mp = listing_data.get("market_price")
     price = listing_data.get("price")
     currency = listing_data.get("currency") or "BYN"
     location = listing_data.get("location") or "Не указано"
     published_at = listing_data.get("published_at")
     url = listing_data.get("url")
 
-    with col1:
-        st.markdown(f"### {title}")
-        if description:
-            short = (description[:200] + "...") if len(description) > 200 else description
-            st.markdown(f"*{short}*")
+    st.markdown(f"### {title}")
+    if description:
+        short = description[:200] + "..." if len(description) > 200 else description
+        st.markdown(f"*{short}*")
 
-    with col2:
-        if market_price is None:
-            st.markdown("### 💩 не хватило данных")
-        else:
-            st.markdown(f"### {format_price(market_price, currency)}")
+    if add_benefits:
+        left, right = st.columns(2)
 
-    with col3:
-        if price is not None:
-            st.markdown(f"**{format_price(price, currency)}**")
-        else:
-            st.markdown("**Цена не указана**")
+        with left:
+            st.caption("Цена в объявлении")
+            st.markdown(f"## {format_price(price, currency) if price is not None else '—'}")
 
-        st.markdown(f"📍 {location}")
-        st.markdown(f"📅 {format_date(published_at)}")
+        with right:
+            st.caption("Рыночная цена (модель)")
+            st.markdown(f"## {format_price(mp, currency) if mp is not None else '💩 не хватило данных'}")
+
+        if mp is not None and price is not None:
+            diff = mp - price
+            sign = "+" if diff > 0 else ""
+            if diff > 0:
+                st.success(f"Выгода: {sign}{format_price(diff, currency)}")
+            else:
+                st.warning(f"Переплата: {sign}{format_price(diff, currency)}")
+    else:
+        st.caption("Цена в объявлении")
+        st.markdown(f"## {format_price(price, currency) if price is not None else '—'}")
+
+    meta1, meta2 = st.columns(2)
+    with meta1:
+        st.caption("📍 Локация")
+        st.write(location)
+    with meta2:
+        st.caption("📅 Дата")
+        st.write(format_date(published_at))
 
     if url:
         st.markdown(f"[🔗 Открыть объявление]({url})")
 
     st.divider()
-
 
 
 def get_listings_from_db(db_path: str = "keyscout.db") -> List[dict]:
@@ -240,7 +304,7 @@ def get_listings_from_db(db_path: str = "keyscout.db") -> List[dict]:
 
 
 # Главное меню - вкладки в шапке
-tab1, tab2, tab3 = st.tabs(["Настройки парсинга", "Результаты", "Аналитика"])
+tab1, tab2, tab3, tab4 = st.tabs(["Настройки парсинга", "Результаты", "Аналитика", "Возможная выгода"])
 
 with tab1:
     st.title("🎹 KeyScout - Парсер объявлений Kufar")
@@ -302,7 +366,7 @@ with tab1:
                     
 
                     db = Database("keyscout.db")
-                    n = db.load_model_specs_csv("/Users/artemsaman/Desktop/KeyScout/Характеристики_по_моделям.csv")  # путь свой
+                    n = db.load_model_specs_csv("Files/Характеристики_по_моделям.csv")  # путь свой
                     print("Характеристики_по_моделям загружены:", n)
                     # db.close()
 
@@ -410,9 +474,8 @@ with tab2:
         st.error(f"❌ Ошибка при загрузке данных: {str(e)}")
         st.exception(e)
 
-
 with tab3:
-    st.subheader("📊 Аналитика рынка")
+    st.title("📊 Аналитика рынка")
 
     # listings — это то, что ты уже получаешь через get_listings_from_db()
     df_m = build_market_analytics_df(listings)
@@ -438,15 +501,8 @@ with tab3:
             st.json({k: (round(v, 2) if isinstance(v, float) else v) for k, v in m.items()})
 
         st.divider()
-
-        # 2) Фильтр "выгодных" (price < market_price)
-        st.subheader("🔥 Выгодные объявления (price < market_price)")
-
-        # дополнительные пороги (опционально, удобно)
-        min_gain = st.slider("Минимальная выгода (BYN)", 0, 500, 50, 10)
-        min_gain_pct = st.slider("Минимальная выгода (%)", 0, 50, 10, 1)
-
-        df_bargains = df_m[(df_m["gain"] >= min_gain) & (df_m["gain_pct"] >= min_gain_pct)].copy()
+        
+        df_bargains = df_m
 
         st.caption(f"Найдено выгодных по фильтрам: {len(df_bargains)}")
 
@@ -458,5 +514,25 @@ with tab3:
 
         # 3) Отображение карточек только выгодных
         for listing in bargain_listings:
-            display_listing_card(listing)
+            display_listing_card(listing, add_benefits=True)
 
+with tab4:
+    st.subheader("Возможная выгода (±15% от рыночной оценки)")
+
+    # listings — список dict из get_listings_from_db()
+    possible = filter_possible_bargains(listings, pct=0.15)
+
+    if not possible:
+        st.info("Нет объявлений с заполненными price и market_price, попадающих в диапазон ±10%.")
+    else:
+        # небольшой summary
+        st.caption(f"Найдено: {len(possible)}")
+
+        # можно добавить быстрый фильтр "показывать только чуть дешевле рынка"
+        only_below = st.checkbox("Показывать только дешевле рынка", value=False)
+        if only_below:
+            possible = [x for x in possible if x.get("delta", 0) < 0]
+
+        # вывод карточек
+        for listing in possible:
+            display_listing_card(listing, add_benefits=True)
