@@ -40,3 +40,8 @@ source .venv/bin/activate
 # .venv\Scripts\activate
 
 pip install -r requirements.txt
+```
+
+<img width="1270" height="1033" alt="Схема работы парсера drawio" src="https://github.com/user-attachments/assets/e0dfb792-e20f-45b6-b9d6-21f4708e28dd" />
+
+
