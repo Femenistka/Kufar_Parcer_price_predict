@@ -2,6 +2,34 @@
 
 Проект собирает актуальные объявления с Kufar (б/у синтезаторы и цифровые пианино), извлекает из названия **бренд / модель / индекс модели**, обогащает объявления характеристиками из справочника и считает **оценку рыночной цены** с помощью ML-модели. Результаты сохраняются в SQLite и показываются в Streamlit UI (результаты, аналитика, “возможная выгода”).
 
+## Интерфейс (Streamlit)
+
+<details>
+  <summary><b>1) Настройки парсинга</b></summary>
+  <br/>
+  <img width="900" alt="Настройки парсинга" src="https://github.com/user-attachments/assets/09c58fdd-eff6-47ad-9a33-f479881abb59" />
+</details>
+
+<details>
+  <summary><b>2) Результаты (карточки + фильтры)</b></summary>
+  <br/>
+  <img width="900" alt="Результаты" src="https://github.com/user-attachments/assets/6a59d00c-4100-46eb-895c-e79153b36e6b" />
+</details>
+
+<details>
+  <summary><b>3) Аналитика рынка (метрики)</b></summary>
+  <br/>
+  <img width="900" alt="Аналитика метрики" src="https://github.com/user-attachments/assets/9377c12a-04f9-413e-a115-8b5571a212ac" />
+</details>
+
+<details>
+  <summary><b>4) Аналитика рынка (выгодные)</b></summary>
+  <br/>
+  <img width="900" alt="Аналитика выгодные" src="https://github.com/user-attachments/assets/54eea4ba-bf6f-4481-8185-3883946cb824" />
+</details>
+
+
+
 ## Основные возможности
 - Парсинг объявлений Kufar по выбранному региону и категории
 - Извлечение из названия:
